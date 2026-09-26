@@ -40,7 +40,7 @@ project/
 ├── docker/                 ← Dockerfile / nginx設定
 ├── backend/                ← CodeIgniter 4 (REST API)
 ├── frontend/                ← Vue 3 (SPA)
-├── db/                      ← トリガー・ストアドプロシージャ・大量データ投入用SQL
+├── db/                      ← トリガー・ストアドプロシージャ・手動運用用プロシージャ・大量データ投入用SQL
 └── docs/                    ← 補助ドキュメント
 ```
 
@@ -281,3 +281,47 @@ docker compose exec db psql -U postgres -d sample_ec -c \
 ```bash
 docker compose exec -T db psql -U postgres -d sample_ec -f - < db/seed_large_data.sql
 ```
+
+### 7.2. 手動運用用プロシージャ（在庫操作・新規登録）
+
+`db/admin_procedures.sql` に、管理画面・APIを経由せずにDBを直接操作するための
+ストアドプロシージャを用意しています。トリガーは作成しないため、
+`db/triggers.sql` と異なりAPI経由の注文と併用しても在庫が二重に減算されることはありません。
+
+適用方法（初回のみ。`migrate:refresh` 等でDBを作り直した場合は再度適用してください）:
+
+```bash
+docker compose exec -T db psql -U postgres -d sample_ec -f - < db/admin_procedures.sql
+```
+
+| プロシージャ | 用途 | `stock_logs.reason` |
+|---|---|---|
+| `sp_register_product(商品名, 価格[, 在庫, カテゴリ, 割引率])` | 商品の新規登録 | `initial`（初期在庫が1以上の場合のみ記録） |
+| `sp_receive_stock(商品ID, 数量)` | 仕入れ（入荷）登録 | `purchase` |
+| `sp_adjust_stock(商品ID, 増減数[, 理由])` | 棚卸差異・破損・返品などの在庫調整 | 指定した理由（省略時は `adjustment`） |
+| `sp_register_customer(氏名, メールアドレス)` | 顧客の新規登録 | - |
+
+`[ ]` 内の引数は省略可能です。
+
+呼び出し例:
+
+```bash
+# 商品の新規登録（在庫30個、割引なし）
+docker compose exec db psql -U postgres -d sample_ec -c \
+  "CALL sp_register_product('ワイヤレス充電器', 3280, 30, 'PCアクセサリ');"
+
+# 商品ID=7 を20個入荷
+docker compose exec db psql -U postgres -d sample_ec -c "CALL sp_receive_stock(7, 20);"
+
+# 商品ID=7 を破損で3個減らす / 返品で1個戻す
+docker compose exec db psql -U postgres -d sample_ec -c "CALL sp_adjust_stock(7, -3);"
+docker compose exec db psql -U postgres -d sample_ec -c "CALL sp_adjust_stock(7, 1, 'return');"
+
+# 顧客の新規登録
+docker compose exec db psql -U postgres -d sample_ec -c \
+  "CALL sp_register_customer('山田 花子', 'hanako@example.com');"
+```
+
+実行結果は `NOTICE: 入荷を登録しました（商品ID: 7, 在庫: 12 → 32）` のように表示されます。
+存在しない商品ID、0以下の入荷数量、調整後の在庫がマイナスになる操作、登録済みのメールアドレスなど
+不正な入力の場合はエラーで中断され、その呼び出しによる変更はすべてロールバックされます。
